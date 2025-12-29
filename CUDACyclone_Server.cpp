@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <csignal>
 #include <ctime>
+#include <vector>
 
 // Global server pointer for signal handling
 static CycloneServer* g_server = nullptr;
@@ -132,7 +133,8 @@ void CycloneServer::stop() {
         accept_thread_.join();
     }
 
-    // Disconnect all clients
+    // Disconnect all clients and collect threads to join
+    std::vector<std::thread> threads_to_join;
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         for (auto& [id, client] : clients_) {
@@ -142,8 +144,15 @@ void CycloneServer::stop() {
             }
             client.connected = false;
             if (client.handler_thread.joinable()) {
-                client.handler_thread.join();
+                threads_to_join.push_back(std::move(client.handler_thread));
             }
+        }
+    }
+
+    // Join threads outside the lock to avoid deadlock
+    for (auto& t : threads_to_join) {
+        if (t.joinable()) {
+            t.join();
         }
     }
 

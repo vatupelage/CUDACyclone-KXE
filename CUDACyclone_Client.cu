@@ -163,7 +163,7 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 }
 
 // ============================================================================
-// MAIN KERNEL (simplified version matching existing implementation)
+// KERNEL (proven working version from CUDACyclone_MultiGPU)
 // ============================================================================
 
 __launch_bounds__(256, 2)
@@ -181,7 +181,8 @@ __global__ void kernel_search(
     FoundResult* __restrict__ d_found_result,
     unsigned long long* __restrict__ hashes_accum,
     unsigned int* __restrict__ d_any_left
-) {
+)
+{
     const int B = (int)batch_size;
     if (B <= 0 || (B & 1) || B > MAX_BATCH_SIZE) return;
     const int half = B >> 1;
@@ -189,7 +190,7 @@ __global__ void kernel_search(
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= threadsTotal) return;
 
-    const unsigned lane = (unsigned)(threadIdx.x & (WARP_SIZE - 1));
+    const unsigned lane      = (unsigned)(threadIdx.x & (WARP_SIZE - 1));
     const unsigned full_mask = 0xFFFFFFFFu;
     if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
@@ -202,230 +203,301 @@ __global__ void kernel_search(
         if (lane == 0 && v) atomicAdd(hashes_accum, v); \
         local_hashes = 0; \
     } while (0)
+    #define MAYBE_WARP_FLUSH() do { if ((local_hashes & (FLUSH_THRESHOLD - 1u)) == 0u) WARP_FLUSH_HASHES(); } while (0)
 
     uint64_t x1[4], y1[4], S[4];
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint64_t idx = gid * 4 + i;
         x1[i] = Px[idx];
         y1[i] = Py[idx];
-        S[i] = start_scalars[idx];
+        S[i]  = start_scalars[idx];
     }
-
     uint64_t rem[4];
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        rem[i] = counts256[gid * 4 + i];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) rem[i] = counts256[gid*4 + i];
+
+    if ((rem[0]|rem[1]|rem[2]|rem[3]) == 0ull) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { Rx[gid*4+i] = x1[i]; Ry[gid*4+i] = y1[i]; }
+        WARP_FLUSH_HASHES(); return;
     }
 
-    for (uint32_t outer = 0; outer < max_batches_per_launch; ++outer) {
-        if (warp_found_ready(d_found_flag, full_mask, lane)) break;
-        if ((rem[0] | rem[1] | rem[2] | rem[3]) == 0) break;
+    uint32_t batches_done = 0;
 
-        // Batch inversion
-        uint64_t subp[(MAX_BATCH_SIZE/2)][4];
-        uint64_t dx_inv[(MAX_BATCH_SIZE/2)][4];
-        uint64_t acc[4];
+    while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
+        if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
-        // Initialize with jump delta
-        ModSub256(acc, c_Jx, x1);
-
-        for (int k = half - 2; k >= 0; --k) {
-            uint64_t dx[4];
-            ModSub256(dx, (uint64_t*)&c_Gx[k * 4], x1);
-            _ModMult(acc, dx);
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) subp[k][j] = acc[j];
-        }
-
-        // Single inversion
+        // Check initial point (S)
         {
-            uint64_t dx0[4];
-            ModSub256(dx0, (uint64_t*)&c_Gx[0], x1);
-            _ModMult(acc, dx0);
-            _ModInv(acc);
-        }
+            uint8_t h20[20];
+            uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
+            getHash160_33_from_limbs(prefix, x1, h20);
+            ++local_hashes; MAYBE_WARP_FLUSH();
 
-        // Back-substitute
-        {
-            ModSub256(dx_inv[0], (uint64_t*)&c_Gx[0], x1);
-            _ModMult(dx_inv[0], acc);
-            _ModMult(dx_inv[0], subp[0]);
-        }
-
-        uint64_t running[4];
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) running[j] = acc[j];
-
-        for (int k = 1; k < half; ++k) {
-            uint64_t dx_prev[4];
-            ModSub256(dx_prev, (uint64_t*)&c_Gx[(k - 1) * 4], x1);
-            _ModMult(running, dx_prev);
-
-            if (k < half - 1) {
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) dx_inv[k][j] = running[j];
-                _ModMult(dx_inv[k], subp[k]);
-            } else {
-                uint64_t dxJ[4];
-                ModSub256(dxJ, c_Jx, x1);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) dx_inv[k][j] = running[j];
-                _ModMult(dx_inv[k], dxJ);
+            bool pref = hash160_prefix_equals(h20, target_prefix);
+            if (__any_sync(full_mask, pref)) {
+                if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        d_found_result->threadId = (int)gid;
+                        d_found_result->iter     = 0;
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
+                        __threadfence_system();
+                        atomicExch(d_found_flag, FOUND_READY);
+                    }
+                }
+                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
         }
 
-        // Process batch
-        for (int k = 0; k < half; ++k) {
-            uint64_t px[4], py[4], pyn[4];
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                px[j] = c_Gx[k * 4 + j];
-                py[j] = c_Gy[k * 4 + j];
-            }
-            ModNeg256(pyn, py);
+        // Batch inversion setup
+        uint64_t subp[MAX_BATCH_SIZE/2][4];
+        uint64_t acc[4], tmp[4];
 
-            // Point addition: P + kG
+#pragma unroll
+        for (int j=0;j<4;++j) acc[j] = c_Jx[j];
+        ModSub256(acc, acc, x1);
+#pragma unroll
+        for (int j=0;j<4;++j) subp[half-1][j] = acc[j];
+
+        for (int i = half - 2; i >= 0; --i) {
+#pragma unroll
+            for (int j=0;j<4;++j) tmp[j] = c_Gx[(size_t)(i+1)*4 + j];
+            ModSub256(tmp, tmp, x1);
+            _ModMult(acc, acc, tmp);
+#pragma unroll
+            for (int j=0;j<4;++j) subp[i][j] = acc[j];
+        }
+
+        uint64_t d0[4], inverse[5];
+#pragma unroll
+        for (int j=0;j<4;++j) d0[j] = c_Gx[0*4 + j];
+        ModSub256(d0, d0, x1);
+#pragma unroll
+        for (int j=0;j<4;++j) inverse[j] = d0[j];
+        _ModMult(inverse, subp[0]);
+        inverse[4] = 0ull;
+        _ModInv(inverse);
+
+        uint64_t sy_neg[4], sx_neg[4];
+        ModNeg256(sy_neg, y1);
+        ModNeg256(sx_neg, x1);
+
+        // Process points 0 to half-2
+        for (int i = 0; i < half - 1; ++i) {
+            if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
+
+            uint64_t dx_inv_i[4];
+            _ModMult(dx_inv_i, subp[i], inverse);
+
+            // Positive branch: P + (i+1)*G
             {
-                uint64_t dy[4], lam[4], lam2[4], x3[4], y3[4];
-                ModSub256(dy, py, y1);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) lam[j] = dx_inv[k][j];
-                _ModMult(lam, dy);
-                _ModSqr(lam2, lam);
-                ModSub256(x3, lam2, x1);
-                ModSub256(x3, px);
+                uint64_t px3[4], s[4], lam[4];
+                uint64_t px_i[4], py_i[4];
+#pragma unroll
+                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
 
-                uint64_t tmp[4];
-                ModSub256(tmp, x1, x3);
-                _ModMult(tmp, lam);
-                ModSub256(y3, tmp, y1);
+                ModSub256(s, py_i, y1);
+                _ModMult(lam, s, dx_inv_i);
 
-                // Check hash
-                uint8_t odd;
-                ModSub256isOdd(y3, y3, &odd);
-                uint8_t h160[20];
-                getHash160_33_from_limbs(odd ? 0x03 : 0x02, x3, h160);
-                ++local_hashes;
+                _ModSqr(px3, lam);
+                ModSub256(px3, px3, x1);
+                ModSub256(px3, px3, px_i);
 
-                if (hash160_prefix_equals(h160, target_prefix)) {
-                    if (hash160_matches_prefix_then_full(h160, c_target_hash160, target_prefix)) {
+                ModSub256(s, x1, px3);
+                _ModMult(s, s, lam);
+                uint8_t odd; ModSub256isOdd(s, y1, &odd);
+
+                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                ++local_hashes; MAYBE_WARP_FLUSH();
+
+                bool pref = hash160_prefix_equals(h20, target_prefix);
+                if (__any_sync(full_mask, pref)) {
+                    if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t Sp[4];
-                            #pragma unroll
-                            for (int j = 0; j < 4; ++j) Sp[j] = S[j];
-                            inc256_device(Sp, (uint64_t)(k + 1));
+                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                            uint64_t addv=(uint64_t)(i+1);
+                            for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
+#pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+#pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
 
-                            #pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                d_found_result->scalar[j] = Sp[j];
-                                d_found_result->Rx[j] = x3[j];
-                                d_found_result->Ry[j] = y3[j];
-                            }
+                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+#pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                            d_found_result->threadId = (int)gid;
+                            d_found_result->iter     = 0;
                             __threadfence_system();
                             atomicExch(d_found_flag, FOUND_READY);
                         }
                     }
+                    __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
             }
 
-            // Point addition: P - kG
+            // Negative branch: P - (i+1)*G
             {
-                uint64_t dy[4], lam[4], lam2[4], x3[4], y3[4];
-                ModSub256(dy, pyn, y1);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) lam[j] = dx_inv[k][j];
-                _ModMult(lam, dy);
-                _ModSqr(lam2, lam);
-                ModSub256(x3, lam2, x1);
-                ModSub256(x3, px);
+                uint64_t px3[4], s[4], lam[4];
+                uint64_t px_i[4], py_i[4];
+#pragma unroll
+                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
+                ModNeg256(py_i, py_i);
 
-                uint64_t tmp[4];
-                ModSub256(tmp, x1, x3);
-                _ModMult(tmp, lam);
-                ModSub256(y3, tmp, y1);
+                ModSub256(s, py_i, y1);
+                _ModMult(lam, s, dx_inv_i);
 
-                // Check hash
-                uint8_t odd;
-                ModSub256isOdd(y3, y3, &odd);
-                uint8_t h160[20];
-                getHash160_33_from_limbs(odd ? 0x03 : 0x02, x3, h160);
-                ++local_hashes;
+                _ModSqr(px3, lam);
+                ModSub256(px3, px3, x1);
+                ModSub256(px3, px3, px_i);
 
-                if (hash160_prefix_equals(h160, target_prefix)) {
-                    if (hash160_matches_prefix_then_full(h160, c_target_hash160, target_prefix)) {
+                ModSub256(s, x1, px3);
+                _ModMult(s, s, lam);
+                uint8_t odd; ModSub256isOdd(s, y1, &odd);
+
+                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                ++local_hashes; MAYBE_WARP_FLUSH();
+
+                bool pref = hash160_prefix_equals(h20, target_prefix);
+                if (__any_sync(full_mask, pref)) {
+                    if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t Sn[4];
-                            #pragma unroll
-                            for (int j = 0; j < 4; ++j) Sn[j] = S[j];
-                            sub256_u64_inplace(Sn, (uint64_t)(k + 1));
-
-                            #pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                d_found_result->scalar[j] = Sn[j];
-                                d_found_result->Rx[j] = x3[j];
-                                d_found_result->Ry[j] = y3[j];
-                            }
+                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                            uint64_t sub=(uint64_t)(i+1);
+                            for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+#pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+#pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+#pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                            d_found_result->threadId = (int)gid;
+                            d_found_result->iter     = 0;
                             __threadfence_system();
                             atomicExch(d_found_flag, FOUND_READY);
                         }
                     }
+                    __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
             }
+
+            // Update inverse for next iteration
+            uint64_t gxmi[4];
+#pragma unroll
+            for (int j=0;j<4;++j) gxmi[j] = c_Gx[(size_t)i*4 + j];
+            ModSub256(gxmi, gxmi, x1);
+            _ModMult(inverse, inverse, gxmi);
         }
 
-        if ((local_hashes & (FLUSH_THRESHOLD - 1u)) == 0u) WARP_FLUSH_HASHES();
-
-        // Jump by batch_size
+        // Process last point (half-1) - only negative branch needed
         {
-            uint64_t dy[4], lam[4], lam2[4], x3[4], y3[4];
-            ModSub256(dy, c_Jy, y1);
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) lam[j] = dx_inv[half - 1][j];
-            _ModMult(lam, dy);
-            _ModSqr(lam2, lam);
-            ModSub256(x3, lam2, x1);
-            ModSub256(x3, c_Jx);
+            const int i = half - 1;
+            uint64_t dx_inv_i[4];
+            _ModMult(dx_inv_i, subp[i], inverse);
 
-            uint64_t tmp[4];
-            ModSub256(tmp, x1, x3);
-            _ModMult(tmp, lam);
-            ModSub256(y3, tmp, y1);
+            uint64_t px3[4], s[4], lam[4];
+            uint64_t px_i[4], py_i[4];
+#pragma unroll
+            for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
+            ModNeg256(py_i, py_i);
 
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                x1[j] = x3[j];
-                y1[j] = y3[j];
+            ModSub256(s, py_i, y1);
+            _ModMult(lam, s, dx_inv_i);
+
+            _ModSqr(px3, lam);
+            ModSub256(px3, px3, x1);
+            ModSub256(px3, px3, px_i);
+
+            ModSub256(s, x1, px3);
+            _ModMult(s, s, lam);
+            uint8_t odd; ModSub256isOdd(s, y1, &odd);
+
+            uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+            ++local_hashes; MAYBE_WARP_FLUSH();
+
+            bool pref = hash160_prefix_equals(h20, target_prefix);
+            if (__any_sync(full_mask, pref)) {
+                if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                        uint64_t sub=(uint64_t)half;
+                        for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                        uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                        d_found_result->threadId = (int)gid;
+                        d_found_result->iter     = 0;
+                        __threadfence_system();
+                        atomicExch(d_found_flag, FOUND_READY);
+                    }
+                }
+                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
+
+            uint64_t last_dx[4];
+#pragma unroll
+            for (int j=0;j<4;++j) last_dx[j] = c_Gx[(size_t)i*4 + j];
+            ModSub256(last_dx, last_dx, x1);
+            _ModMult(inverse, inverse, last_dx);
         }
 
-        // Update scalar
-        inc256_device(S, (uint64_t)B);
+        // Jump to next batch
+        {
+            uint64_t lam[4], s[4], x3[4], y3[4];
 
-        // Decrement remaining
-        sub256_u64_inplace(rem, (uint64_t)B);
+            uint64_t Jy_minus_y1[4];
+#pragma unroll
+            for (int j=0;j<4;++j) Jy_minus_y1[j] = c_Jy[j];
+            ModSub256(Jy_minus_y1, Jy_minus_y1, y1);
+
+            _ModMult(lam, Jy_minus_y1, inverse);
+            _ModSqr(x3, lam);
+            ModSub256(x3, x3, x1);
+            uint64_t Jx_local[4]; for (int j=0;j<4;++j) Jx_local[j]=c_Jx[j];
+            ModSub256(x3, x3, Jx_local);
+
+            ModSub256(s, x1, x3);
+            _ModMult(y3, s, lam);
+            ModSub256(y3, y3, y1);
+
+#pragma unroll
+            for (int j=0;j<4;++j) { x1[j] = x3[j]; y1[j] = y3[j]; }
+        }
+
+        // Update scalar and remaining count
+        {
+            uint64_t addv=(uint64_t)B;
+            for (int k=0;k<4 && addv;++k){ uint64_t old=S[k]; S[k]=old+addv; addv=(S[k]<old)?1ull:0ull; }
+            sub256_u64_inplace(rem, (uint64_t)B);
+        }
+        ++batches_done;
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        Rx[gid*4+i] = x1[i];
+        Ry[gid*4+i] = y1[i];
+        counts256[gid*4+i] = rem[i];
+        start_scalars[gid*4+i] = S[i];
+    }
+    if ((rem[0] | rem[1] | rem[2] | rem[3]) != 0ull) {
+        atomicAdd(d_any_left, 1u);
     }
 
     WARP_FLUSH_HASHES();
-
-    // Write back
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const uint64_t idx = gid * 4 + i;
-        Rx[idx] = x1[i];
-        Ry[idx] = y1[i];
-        start_scalars[idx] = S[i];
-        counts256[idx] = rem[i];
-    }
-
-    bool has_work = (rem[0] | rem[1] | rem[2] | rem[3]) != 0;
-    unsigned any = __any_sync(full_mask, has_work ? 1u : 0u);
-    if (lane == 0 && any) {
-        atomicOr(d_any_left, 1u);
-    }
-
-    #undef FLUSH_THRESHOLD
+    #undef MAYBE_WARP_FLUSH
     #undef WARP_FLUSH_HASHES
+    #undef FLUSH_THRESHOLD
 }
 
 // ============================================================================

@@ -3,6 +3,8 @@
 CUDACyclone
 CUDACyclone_MultiGPU
 CUDACyclone_Pincer
+CUDACyclone_Server
+CUDACyclone_Client
 
 # Checkpoint files
 *.ckpt
