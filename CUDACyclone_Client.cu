@@ -714,13 +714,15 @@ void send_unit_complete(uint32_t unit_id, uint64_t keys_processed, double avg_sp
     send_to_server(MessageType::UNIT_COMPLETE, &msg, sizeof(msg));
 }
 
-void send_found_result(uint32_t unit_id, const FoundResult& result) {
+void send_found_result(uint32_t unit_id, const FoundResult& result, const uint8_t target_hash160[20]) {
     FoundResultMsg msg;
     msg.client_id = g_client_id;
     msg.unit_id = unit_id;
     memcpy(msg.scalar, result.scalar, sizeof(msg.scalar));
     memcpy(msg.pubkey_x, result.Rx, sizeof(msg.pubkey_x));
     memcpy(msg.pubkey_y, result.Ry, sizeof(msg.pubkey_y));
+    // Copy the target hash160 - we know the found result matches it
+    memcpy(msg.hash160, target_hash160, 20);
     send_to_server(MessageType::FOUND_RESULT, &msg, sizeof(msg));
 }
 
@@ -983,7 +985,7 @@ void execute_work_unit(std::vector<GPUContext>& contexts,
     if (g_found_global.load()) {
         std::cout << "[Client] KEY FOUND!\n";
         std::cout << "[Client] Private key: " << formatHex256(g_global_result.scalar) << "\n";
-        send_found_result(work.unit_id, g_global_result);
+        send_found_result(work.unit_id, g_global_result, work.target_hash160);
     } else {
         std::cout << "[Client] Work unit #" << work.unit_id << " completed\n";
         send_unit_complete(work.unit_id, total_hashes.load(), avg_speed);
