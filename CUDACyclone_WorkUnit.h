@@ -14,6 +14,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <iostream>
 #include <stdexcept>
 
 #include "CUDACyclone_Protocol.h"
@@ -129,13 +130,17 @@ inline void dec(uint64_t v[4]) {
 // Left shift by n bits (n must be 0-255)
 inline void shl(const uint64_t a[4], int n, uint64_t out[4]) {
     if (n == 0) {
-        copy(a, out);
+        if (a != out) copy(a, out);
         return;
     }
     if (n >= 256) {
         zero(out);
         return;
     }
+
+    // Copy input first to handle aliasing (when a == out)
+    uint64_t tmp[4];
+    copy(a, tmp);
 
     int word_shift = n / 64;
     int bit_shift = n % 64;
@@ -144,13 +149,13 @@ inline void shl(const uint64_t a[4], int n, uint64_t out[4]) {
 
     if (bit_shift == 0) {
         for (int i = word_shift; i < 4; ++i) {
-            out[i] = a[i - word_shift];
+            out[i] = tmp[i - word_shift];
         }
     } else {
         for (int i = word_shift; i < 4; ++i) {
-            out[i] = a[i - word_shift] << bit_shift;
+            out[i] = tmp[i - word_shift] << bit_shift;
             if (i > word_shift) {
-                out[i] |= a[i - word_shift - 1] >> (64 - bit_shift);
+                out[i] |= tmp[i - word_shift - 1] >> (64 - bit_shift);
             }
         }
     }
@@ -159,13 +164,17 @@ inline void shl(const uint64_t a[4], int n, uint64_t out[4]) {
 // Right shift by n bits
 inline void shr(const uint64_t a[4], int n, uint64_t out[4]) {
     if (n == 0) {
-        copy(a, out);
+        if (a != out) copy(a, out);
         return;
     }
     if (n >= 256) {
         zero(out);
         return;
     }
+
+    // Copy input first to handle aliasing (when a == out)
+    uint64_t tmp[4];
+    copy(a, tmp);
 
     int word_shift = n / 64;
     int bit_shift = n % 64;
@@ -174,13 +183,13 @@ inline void shr(const uint64_t a[4], int n, uint64_t out[4]) {
 
     if (bit_shift == 0) {
         for (int i = 0; i < 4 - word_shift; ++i) {
-            out[i] = a[i + word_shift];
+            out[i] = tmp[i + word_shift];
         }
     } else {
         for (int i = 0; i < 4 - word_shift; ++i) {
-            out[i] = a[i + word_shift] >> bit_shift;
+            out[i] = tmp[i + word_shift] >> bit_shift;
             if (i + word_shift + 1 < 4) {
-                out[i] |= a[i + word_shift + 1] << (64 - bit_shift);
+                out[i] |= tmp[i + word_shift + 1] << (64 - bit_shift);
             }
         }
     }

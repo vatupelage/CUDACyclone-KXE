@@ -222,7 +222,7 @@ void CycloneServer::accept_thread() {
             client.connected = true;
 
             std::cout << "[Server] New connection from " << client_addr << ":"
-                      << client_port << " (client #" << client_id << ")\n";
+                      << client_port << " (client #" << client_id << ")\n" << std::flush;
 
             // Start handler thread
             client.handler_thread = std::thread(&CycloneServer::client_handler, this, client_id);
