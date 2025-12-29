@@ -1,0 +1,27 @@
+# Build artifacts
+*.o
+CUDACyclone
+CUDACyclone_MultiGPU
+CUDACyclone_Pincer
+
+# Checkpoint files
+*.ckpt
+*.checkpoint
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# Test outputs
+cyclone_tests_results.txt
+*.bin
+
+# OS files
+.DS_Store
+Thumbs.db
