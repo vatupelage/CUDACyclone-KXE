@@ -3,10 +3,13 @@ TARGET_MULTI  := CUDACyclone_MultiGPU
 TARGET_PINCER := CUDACyclone_Pincer
 TARGET_SERVER := CUDACyclone_Server
 TARGET_CLIENT := CUDACyclone_Client
+TARGET_KXE    := CUDACyclone_KXE
+TARGET_KXE_MULTI := CUDACyclone_KXE_MultiGPU
 
 SRC          := CUDACyclone.cu CUDAHash.cu
 SRC_MULTI    := CUDACyclone_MultiGPU.cu CUDAHash.cu
 SRC_PINCER   := CUDACyclone_MultiGPU_Pincer.cu CUDAHash.cu
+SRC_KXE      := CUDACyclone_KXE.cu CUDAHash.cu
 
 OBJ          := $(SRC:.cu=.o)
 OBJ_MULTI    := $(SRC_MULTI:.cu=.o)
@@ -77,7 +80,21 @@ distributed: $(TARGET_SERVER) $(TARGET_CLIENT)
 # ============================================================================
 
 # Build absolutely everything
-everything: $(TARGET) $(TARGET_MULTI) $(TARGET_PINCER) $(TARGET_SERVER) $(TARGET_CLIENT)
+everything: $(TARGET) $(TARGET_MULTI) $(TARGET_PINCER) $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_KXE)
+
+# ============================================================================
+# KXE (PERMUTED SCANNING) TARGETS
+# ============================================================================
+
+# KXE single-GPU version
+kxe: $(TARGET_KXE)
+
+# KXE multi-GPU version
+kxe-multi: $(TARGET_KXE_MULTI)
+
+# KXE test suite
+test-kxe: kxe/tests/test_bijection
+	./kxe/tests/test_bijection
 
 # ============================================================================
 # BUILD RULES
@@ -103,6 +120,18 @@ $(TARGET_SERVER): CUDACyclone_Server.o CUDACyclone_Network.o
 $(TARGET_CLIENT): CUDACyclone_Client.o CUDAHash.o CUDACyclone_Network.o
 	$(NVCC) $(NVCC_FLAGS) $(NVCC_CXXFLAGS) CUDACyclone_Client.o CUDAHash.o CUDACyclone_Network.o -o $@ $(LDFLAGS_MULTI)
 
+# KXE single-GPU binary
+$(TARGET_KXE): CUDACyclone_KXE.o CUDAHash.o
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_CXXFLAGS) CUDACyclone_KXE.o CUDAHash.o -o $@ $(LDFLAGS)
+
+# KXE multi-GPU binary
+$(TARGET_KXE_MULTI): CUDACyclone_KXE_MultiGPU.o CUDAHash.o
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_CXXFLAGS) CUDACyclone_KXE_MultiGPU.o CUDAHash.o -o $@ $(LDFLAGS_MULTI)
+
+# KXE test binary (host-only, no CUDA)
+kxe/tests/test_bijection: kxe/tests/test_bijection.cpp kxe/KXEPermutation.cuh
+	$(CXX) $(CXXFLAGS) -o $@ kxe/tests/test_bijection.cpp
+
 # ============================================================================
 # OBJECT FILE RULES
 # ============================================================================
@@ -127,8 +156,9 @@ CUDACyclone_Client.o: CUDACyclone_Client.cu CUDACyclone_Network.h CUDACyclone_Pr
 # ============================================================================
 
 clean:
-	rm -f $(TARGET) $(TARGET_MULTI) $(TARGET_PINCER) $(TARGET_SERVER) $(TARGET_CLIENT)
+	rm -f $(TARGET) $(TARGET_MULTI) $(TARGET_PINCER) $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_KXE) $(TARGET_KXE_MULTI)
 	rm -f *.o
+	rm -f kxe/tests/test_bijection
 
 clean-obj:
 	rm -f *.o
@@ -148,6 +178,11 @@ help:
 	@echo "  make pincer       - Build pincer (bidirectional) version"
 	@echo "  make standalone   - Build all standalone versions"
 	@echo ""
+	@echo "KXE (Permuted Scanning) targets:"
+	@echo "  make kxe          - Build KXE single-GPU version"
+	@echo "  make kxe-multi    - Build KXE multi-GPU version"
+	@echo "  make test-kxe     - Build and run KXE tests"
+	@echo ""
 	@echo "Distributed mode targets:"
 	@echo "  make server       - Build server (coordinator, no CUDA)"
 	@echo "  make client       - Build client (GPU worker)"
@@ -163,4 +198,4 @@ help:
 	@echo ""
 	@echo "Detected GPU architecture: SM$(GPU_ARCH)"
 
-.PHONY: all single multi pincer both standalone server client distributed everything clean clean-obj help
+.PHONY: all single multi pincer both standalone server client distributed everything clean clean-obj help kxe kxe-multi test-kxe

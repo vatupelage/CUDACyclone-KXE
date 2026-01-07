@@ -5,6 +5,11 @@ CUDACyclone_MultiGPU
 CUDACyclone_Pincer
 CUDACyclone_Server
 CUDACyclone_Client
+CUDACyclone_KXE
+CUDACyclone_KXE_MultiGPU
+
+# KXE test binaries
+kxe/tests/test_bijection
 
 # Checkpoint files
 *.ckpt
