@@ -534,6 +534,36 @@ extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
 // ============================================================================
+// 256-BIT ARITHMETIC HELPERS
+// ============================================================================
+
+uint64_t calculate_total_blocks_256(const uint64_t range_width[4], uint64_t keys_per_block) {
+    if (range_width[1] == 0 && range_width[2] == 0 && range_width[3] == 0) {
+        if (range_width[0] == 0) return 0;
+        return (range_width[0] + keys_per_block - 1) / keys_per_block;
+    }
+
+    __uint128_t result = 0;
+    __uint128_t remainder = 0;
+
+    for (int i = 3; i >= 0; --i) {
+        remainder = (remainder << 64) | range_width[i];
+        if (remainder >= keys_per_block) {
+            __uint128_t quotient = remainder / keys_per_block;
+            remainder = remainder % keys_per_block;
+            result = (result << 64) | quotient;
+        } else {
+            result = result << 64;
+        }
+    }
+
+    if (remainder > 0) result++;
+    if (result > UINT64_MAX) return UINT64_MAX;
+
+    return (uint64_t)result;
+}
+
+// ============================================================================
 // CUDA ERROR CHECK
 // ============================================================================
 
@@ -850,10 +880,14 @@ int main(int argc, char** argv) {
     // Block size = threadsTotal * batches_per_thread * batch_size
     uint64_t batches_per_thread = 10;  // Fixed for simplicity
     uint64_t keys_per_block = threadsTotal * batches_per_thread * batch_size;
-    uint64_t range_width_64 = range_width[0];
-    uint64_t total_blocks = (range_width_64 + keys_per_block - 1) / keys_per_block;
+    uint64_t total_blocks = calculate_total_blocks_256(range_width, keys_per_block);
 
-    std::cout << "Keys per block: " << keys_per_block << " (~" << (keys_per_block / 1e6) << "M)\n";
+    if (total_blocks == 0) {
+        std::cerr << "Error: Range too small or invalid\n";
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "Keys per block: " << keys_per_block << " (~" << (keys_per_block / 1e9) << "B)\n";
     std::cout << "Total blocks: " << total_blocks << "\n";
     std::cout << "Batches per thread: " << batches_per_thread << "\n";
 

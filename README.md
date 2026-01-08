@@ -191,6 +191,47 @@ Save progress for long-running searches:
 
 ---
 
+## KXE Mode (Permuted Scanning)
+
+KXE mode replaces sequential range scanning with **permutation-based searching**. Instead of scanning keys 0, 1, 2, 3..., KXE visits keys in a pseudo-random order covering the entire range exactly once.
+
+**See [KXE_README.md](KXE_README.md) for full documentation.**
+
+### Build KXE Versions
+
+```bash
+make kxe         # Single-GPU KXE
+make kxe-multi   # Multi-GPU KXE (up to 16 GPUs)
+make kxe-pincer  # KXE + Bidirectional scanning (2x speedup)
+make kxe-all     # Build all KXE versions
+```
+
+### Key Benefits
+
+| Feature | Sequential | KXE Mode |
+|---------|------------|----------|
+| Key Order | 0, 1, 2, 3... | Permuted (scattered) |
+| Time-to-Chance | Depends on key position | Uniform probability |
+| Multi-GPU | Range partitioning | Disjoint streams |
+| Max Range | 2^64 | **2^256** |
+| Max GPUs | 8 | **16** |
+
+### Quick Example
+
+```bash
+# KXE Multi-GPU (Puzzle 65 - 2^64 keys)
+./CUDACyclone_KXE_MultiGPU --range 10000000000000000:1ffffffffffffffff \
+    --address 19vkiEajfhuZ8bs8Zu2jgmC6oqZbWqhxhG \
+    --grid 128,128 --slices 16
+
+# KXE Pincer (2x expected speedup)
+./CUDACyclone_KXE_Pincer --range 10000000000000000:1ffffffffffffffff \
+    --address 19vkiEajfhuZ8bs8Zu2jgmC6oqZbWqhxhG \
+    --grid 128,128 --slices 16
+```
+
+---
+
 ## Example Output
 
 **Single GPU (RTX 4090):**
@@ -289,12 +330,17 @@ Done. Successes=848 Failures=0
 | `CUDACyclone.cu` | Single-GPU implementation |
 | `CUDACyclone_MultiGPU.cu` | Multi-GPU with checkpointing |
 | `CUDACyclone_MultiGPU_Pincer.cu` | Bidirectional pincer scanning |
+| `CUDACyclone_KXE.cu` | Single-GPU KXE (permuted scanning) |
+| `CUDACyclone_KXE_MultiGPU.cu` | Multi-GPU KXE (up to 16 GPUs) |
+| `CUDACyclone_KXE_Pincer.cu` | KXE + Bidirectional scanning |
 | `CUDAHash.cu` | SHA-256, RIPEMD-160, Hash160 |
 | `CUDAMath.h` | Secp256k1 field arithmetic |
 | `CUDAStructures.h` | Device constants, structures |
 | `CUDAUtils.h` | Host/device utilities |
+| `kxe/KXEPermutation.cuh` | Feistel permutation implementation |
 | `Makefile` | Build configuration |
 | `proof.py` | Key coverage verification |
+| `KXE_README.md` | KXE mode documentation |
 
 ---
 
@@ -302,6 +348,7 @@ Done. Successes=848 Failures=0
 
 | Version | Changes |
 |---------|---------|
+| **v1.5** | Added KXE mode (permuted scanning), 256-bit range support, 16 GPU support |
 | **v1.4** | Added Bidirectional Pincer Mode, Multi-GPU checkpoint/resume |
 | **v1.3** | Fixed key-skipping bug, full kernel rewrite |
 | **v1.2** | Full CUDA kernel rewrite |

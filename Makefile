@@ -5,6 +5,7 @@ TARGET_SERVER := CUDACyclone_Server
 TARGET_CLIENT := CUDACyclone_Client
 TARGET_KXE    := CUDACyclone_KXE
 TARGET_KXE_MULTI := CUDACyclone_KXE_MultiGPU
+TARGET_KXE_PINCER := CUDACyclone_KXE_Pincer
 
 SRC          := CUDACyclone.cu CUDAHash.cu
 SRC_MULTI    := CUDACyclone_MultiGPU.cu CUDAHash.cu
@@ -92,6 +93,12 @@ kxe: $(TARGET_KXE)
 # KXE multi-GPU version
 kxe-multi: $(TARGET_KXE_MULTI)
 
+# KXE pincer (bidirectional) multi-GPU version
+kxe-pincer: $(TARGET_KXE_PINCER)
+
+# Build all KXE versions
+kxe-all: $(TARGET_KXE) $(TARGET_KXE_MULTI) $(TARGET_KXE_PINCER)
+
 # KXE test suite
 test-kxe: kxe/tests/test_bijection
 	./kxe/tests/test_bijection
@@ -128,6 +135,10 @@ $(TARGET_KXE): CUDACyclone_KXE.o CUDAHash.o
 $(TARGET_KXE_MULTI): CUDACyclone_KXE_MultiGPU.o CUDAHash.o
 	$(NVCC) $(NVCC_FLAGS) $(NVCC_CXXFLAGS) CUDACyclone_KXE_MultiGPU.o CUDAHash.o -o $@ $(LDFLAGS_MULTI)
 
+# KXE pincer (bidirectional) multi-GPU binary
+$(TARGET_KXE_PINCER): CUDACyclone_KXE_Pincer.o CUDAHash.o
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_CXXFLAGS) CUDACyclone_KXE_Pincer.o CUDAHash.o -o $@ $(LDFLAGS_MULTI)
+
 # KXE test binary (host-only, no CUDA)
 kxe/tests/test_bijection: kxe/tests/test_bijection.cpp kxe/KXEPermutation.cuh
 	$(CXX) $(CXXFLAGS) -o $@ kxe/tests/test_bijection.cpp
@@ -156,7 +167,7 @@ CUDACyclone_Client.o: CUDACyclone_Client.cu CUDACyclone_Network.h CUDACyclone_Pr
 # ============================================================================
 
 clean:
-	rm -f $(TARGET) $(TARGET_MULTI) $(TARGET_PINCER) $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_KXE) $(TARGET_KXE_MULTI)
+	rm -f $(TARGET) $(TARGET_MULTI) $(TARGET_PINCER) $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_KXE) $(TARGET_KXE_MULTI) $(TARGET_KXE_PINCER)
 	rm -f *.o
 	rm -f kxe/tests/test_bijection
 
@@ -181,6 +192,8 @@ help:
 	@echo "KXE (Permuted Scanning) targets:"
 	@echo "  make kxe          - Build KXE single-GPU version"
 	@echo "  make kxe-multi    - Build KXE multi-GPU version"
+	@echo "  make kxe-pincer   - Build KXE pincer (2x speedup, requires even # GPUs)"
+	@echo "  make kxe-all      - Build all KXE versions"
 	@echo "  make test-kxe     - Build and run KXE tests"
 	@echo ""
 	@echo "Distributed mode targets:"
@@ -198,4 +211,4 @@ help:
 	@echo ""
 	@echo "Detected GPU architecture: SM$(GPU_ARCH)"
 
-.PHONY: all single multi pincer both standalone server client distributed everything clean clean-obj help kxe kxe-multi test-kxe
+.PHONY: all single multi pincer both standalone server client distributed everything clean clean-obj help kxe kxe-multi kxe-pincer kxe-all test-kxe

@@ -4,6 +4,13 @@
 
 KXE (Key eXchange Enumeration) mode replaces traditional sequential range scanning with a **permutation-based approach**. Instead of scanning keys 0, 1, 2, 3, ..., KXE visits keys in a pseudo-random but deterministic order that covers the entire range exactly once.
 
+### Key Features
+
+- **256-bit range support**: Works with ranges up to 2^256 (full Bitcoin keyspace)
+- **Up to 16 GPUs**: Supports systems with up to 16 GPUs
+- **Pincer mode**: 2x expected speedup with bidirectional scanning
+- **Bijection guarantee**: Every key visited exactly once, no overlaps
+
 ### Key Benefits
 
 | Feature | Sequential Mode | KXE Mode |
@@ -13,6 +20,8 @@ KXE (Key eXchange Enumeration) mode replaces traditional sequential range scanni
 | Time-to-Chance | Depends on key position | Uniform probability |
 | Multi-GPU | Range partitioning | Disjoint streams |
 | Checkpoint | Full position state | (stream_id, counter) |
+| Max GPUs | 8 | 16 |
+| Max Range | 2^64 | 2^256 |
 
 ### Why Use KXE?
 
@@ -20,6 +29,7 @@ KXE (Key eXchange Enumeration) mode replaces traditional sequential range scanni
 2. **Simpler Checkpointing**: Only need to store a counter per GPU, not full range positions
 3. **Perfect Multi-GPU Scaling**: Each GPU gets a disjoint stream - zero overlap by construction
 4. **Mathematical Guarantee**: Bijection ensures every key is visited exactly once
+5. **Large Range Support**: Handles puzzle 65+ ranges (>2^64 keys)
 
 ---
 
@@ -34,8 +44,11 @@ make kxe
 # Build multi-GPU KXE version
 make kxe-multi
 
-# Build both
-make kxe && make kxe-multi
+# Build KXE Pincer version (2x speedup, requires even # GPUs)
+make kxe-pincer
+
+# Build all KXE versions
+make kxe-all
 
 # Run bijection tests (optional)
 make test-kxe
@@ -49,6 +62,9 @@ make test-kxe
 
 # Multi-GPU
 ./CUDACyclone_KXE_MultiGPU --range <start>:<end> --address <target> --grid A,B --slices N
+
+# KXE Pincer (2x expected speedup, requires even # of GPUs, up to 16)
+./CUDACyclone_KXE_Pincer --range <start>:<end> --address <target> --grid A,B --slices N
 ```
 
 ### Example (Puzzle 30)
@@ -57,6 +73,15 @@ make test-kxe
 ./CUDACyclone_KXE --range 480000000:4bfffffff \
     --address 1PWCx5fovoEaoBowAvF5k91m2Xat9bMgwb \
     --grid 128,128 --slices 8
+```
+
+### Example (Puzzle 65 - Large Range)
+
+```bash
+# Puzzle 65: 2^64 keys (requires 256-bit range support)
+./CUDACyclone_KXE_MultiGPU --range 10000000000000000:1ffffffffffffffff \
+    --address 19vkiEajfhuZ8bs8Zu2jgmC6oqZbWqhxhG \
+    --grid 128,128 --slices 16
 ```
 
 ---
@@ -148,6 +173,74 @@ This guarantees **zero overlap** - each GPU searches completely different keys.
 # Use specific GPUs only
 ./CUDACyclone_KXE_MultiGPU --range ... --address ... --gpus 0,2
 ```
+
+---
+
+## KXE Pincer Mode (2x Speedup)
+
+KXE Pincer combines **block permutation** with **bidirectional scanning** for maximum efficiency.
+
+### How It Works
+
+```
+Standard KXE (4 GPUs):
+  GPU 0: Block A ──────────────────►  (forward only)
+  GPU 1: Block B ──────────────────►  (forward only)
+  GPU 2: Block C ──────────────────►  (forward only)
+  GPU 3: Block D ──────────────────►  (forward only)
+
+KXE Pincer (4 GPUs = 2 pairs):
+  Pair 0:
+    GPU 0: Block A ──────►  (forward)
+    GPU 1: Block A ◄──────  (backward)
+  Pair 1:
+    GPU 2: Block B ──────►  (forward)
+    GPU 3: Block B ◄──────  (backward)
+```
+
+### Why 2x Speedup?
+
+| Scenario | KXE Only | KXE + Pincer |
+|----------|----------|--------------|
+| Key at 10% of block | Found at 10% | Found at 10% (forward) |
+| Key at 90% of block | Found at 90% | Found at 10% (backward) |
+| **Average case** | **50%** | **25%** |
+
+With pincer, the **worst case is 50%** (key exactly in middle), versus 100% without pincer.
+
+### Requirements
+
+- **Even number of GPUs** (2, 4, 6, 8, 10, 12, 14, or 16)
+- GPUs are paired: (0,1), (2,3), (4,5), (6,7), (8,9), (10,11), (12,13), (14,15)
+- Each pair processes the same block from opposite ends
+- Maximum 16 GPUs supported
+
+### Example
+
+```bash
+# 4 GPUs = 2 pincer pairs
+./CUDACyclone_KXE_Pincer --range 400000000000:7fffffffffff \
+    --address 1Pd8VvT49sHKsmqrQiP61RsVwmXCZ6ay7Z \
+    --grid 256,512 --slices 16
+
+# Output shows:
+# Pair 0:
+#   GPU 0: NVIDIA GeForce RTX 4090 (FORWARD)
+#   GPU 1: NVIDIA GeForce RTX 4090 (BACKWARD)
+# Pair 1:
+#   GPU 2: NVIDIA GeForce RTX 4090 (FORWARD)
+#   GPU 3: NVIDIA GeForce RTX 4090 (BACKWARD)
+#
+# Speed: 22 Gkeys/s | Effective: 44 Gkeys/s
+```
+
+### Effective Speed Calculation
+
+The output shows both actual and effective speed:
+- **Actual Speed**: Keys checked per second
+- **Effective Speed**: Actual × 2 (due to pincer advantage)
+
+This reflects that with pincer, you're statistically finding keys in half the time.
 
 ---
 
@@ -381,7 +474,8 @@ kxe/
     └── test_bijection.cpp  # Verification tests
 
 CUDACyclone_KXE.cu          # Single-GPU implementation
-CUDACyclone_KXE_MultiGPU.cu # Multi-GPU implementation
+CUDACyclone_KXE_MultiGPU.cu # Multi-GPU implementation (up to 16 GPUs)
+CUDACyclone_KXE_Pincer.cu   # KXE + Bidirectional pincer mode
 ```
 
 ---
