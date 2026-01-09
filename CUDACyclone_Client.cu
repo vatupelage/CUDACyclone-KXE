@@ -31,6 +31,78 @@
 #include "CUDACyclone_Network.h"
 
 // ============================================================================
+// KXE PERMUTATION (Host-side for computing block ranges)
+// ============================================================================
+
+namespace kxe_host {
+
+// Feistel round function (host-side)
+inline uint64_t feistel_round(uint64_t half, uint32_t round_key) {
+    uint64_t x = half ^ (uint64_t)round_key;
+    x = x * 0x517cc1b727220a95ULL;
+    x ^= (x >> 33);
+    x = x * 0x9e3779b97f4a7c15ULL;
+    x ^= (x >> 33);
+    return x;
+}
+
+// 4-round Feistel permutation (host-side)
+inline uint64_t feistel_permute(uint64_t input, uint64_t domain_size, uint64_t seed) {
+    int half_bits = 32;
+    uint64_t mask = 0xFFFFFFFFULL;
+
+    // Adjust for smaller domains
+    if (domain_size <= (1ULL << 16)) {
+        half_bits = 8;
+        mask = 0xFFULL;
+    } else if (domain_size <= (1ULL << 32)) {
+        half_bits = 16;
+        mask = 0xFFFFULL;
+    }
+
+    uint64_t L = input >> half_bits;
+    uint64_t R = input & mask;
+
+    // Derive round keys from seed
+    uint32_t round_keys[4];
+    uint64_t key_state = seed;
+    for (int i = 0; i < 4; ++i) {
+        key_state = key_state * 0x5851f42d4c957f2dULL + 0x14057b7ef767814fULL;
+        round_keys[i] = (uint32_t)(key_state >> 32);
+    }
+
+    // 4 Feistel rounds
+    for (int r = 0; r < 4; ++r) {
+        uint64_t F = feistel_round(R, round_keys[r]) & mask;
+        uint64_t new_L = R;
+        uint64_t new_R = L ^ F;
+        L = new_L;
+        R = new_R;
+    }
+
+    return (L << half_bits) | R;
+}
+
+// Permute block index with cycle-walking for non-power-of-2 domains
+inline uint64_t permute_block(uint64_t block_index, uint64_t total_blocks, uint64_t seed) {
+    if (total_blocks <= 1) return 0;
+
+    // Find smallest power of 2 >= total_blocks
+    uint64_t domain_size = 1;
+    while (domain_size < total_blocks) domain_size <<= 1;
+
+    // Cycle-walk until we get a valid block index
+    uint64_t permuted = block_index;
+    do {
+        permuted = feistel_permute(permuted, domain_size, seed);
+    } while (permuted >= total_blocks);
+
+    return permuted;
+}
+
+} // namespace kxe_host
+
+// ============================================================================
 // CONSTANTS
 // ============================================================================
 
@@ -141,6 +213,11 @@ static FoundResult g_global_result;
 static std::mutex g_socket_mutex;
 static socket_t g_server_socket = INVALID_SOCKET_VALUE;
 static uint32_t g_client_id = 0;
+
+// KXE mode state (set during registration)
+static bool g_kxe_mode = false;
+static uint64_t g_kxe_seed = 0;
+static uint64_t g_total_blocks = 0;
 
 static void signal_handler(int) {
     g_running.store(false);
@@ -641,7 +718,17 @@ bool register_with_server(const ClientConfig& config, const std::vector<GPUConte
     }
 
     g_client_id = resp.client_id;
+
+    // Capture KXE mode settings from server
+    g_kxe_mode = (resp.scan_mode == static_cast<uint8_t>(ScanMode::KXE));
+    g_kxe_seed = resp.kxe_seed;
+    g_total_blocks = resp.total_blocks;
+
     std::cout << "[Client] Registered as client #" << g_client_id << "\n";
+    if (g_kxe_mode) {
+        std::cout << "[Client] KXE mode enabled (seed: " << g_kxe_seed
+                  << ", blocks: " << g_total_blocks << ")\n";
+    }
     return true;
 }
 
@@ -737,14 +824,55 @@ void execute_work_unit(std::vector<GPUContext>& contexts,
     uint32_t batch_size = work.batch_size > 0 ? work.batch_size : config.batch_size;
     uint32_t slices = work.slices > 0 ? work.slices : config.slices_per_launch;
 
-    std::cout << "[Client] Executing work unit #" << work.unit_id << "\n";
-    std::cout << "[Client] Range: " << formatHex256(work.range_start) << " : "
-              << formatHex256(work.range_end) << "\n";
-
-    // Calculate range size
+    // Determine actual range to search
+    uint64_t actual_range_start[4];
+    uint64_t actual_range_end[4];
     uint64_t range_len[4];
-    sub256(work.range_end, work.range_start, range_len);
-    add256_u64(range_len, 1, range_len);
+
+    bool is_kxe = (work.scan_mode == static_cast<uint8_t>(ScanMode::KXE));
+
+    if (is_kxe && work.keys_per_block > 0) {
+        // KXE mode: compute actual range from permuted block index
+        uint64_t block_index = work.kxe_block_index;
+        uint64_t total_blocks = g_total_blocks;
+        uint64_t seed = work.kxe_seed;
+
+        // Permute the block index
+        uint64_t permuted_block = kxe_host::permute_block(block_index, total_blocks, seed);
+
+        // Calculate block start: global_range_start + permuted_block * keys_per_block
+        memcpy(actual_range_start, work.range_start, sizeof(actual_range_start));
+        uint64_t block_offset[4] = {0, 0, 0, 0};
+        __uint128_t prod = (__uint128_t)permuted_block * work.keys_per_block;
+        block_offset[0] = (uint64_t)prod;
+        block_offset[1] = (uint64_t)(prod >> 64);
+        add256(actual_range_start, block_offset, actual_range_start);
+
+        // Block end: block_start + keys_per_block - 1
+        memcpy(actual_range_end, actual_range_start, sizeof(actual_range_end));
+        add256_u64(actual_range_end, work.keys_per_block - 1, actual_range_end);
+
+        // Range length = keys_per_block
+        range_len[0] = work.keys_per_block;
+        range_len[1] = range_len[2] = range_len[3] = 0;
+
+        std::cout << "[Client] Executing KXE block #" << work.unit_id
+                  << " (permuted: " << permuted_block << ")\n";
+        std::cout << "[Client] Block range: " << formatHex256(actual_range_start)
+                  << " : " << formatHex256(actual_range_end) << "\n";
+    } else {
+        // Sequential mode: use range directly
+        memcpy(actual_range_start, work.range_start, sizeof(actual_range_start));
+        memcpy(actual_range_end, work.range_end, sizeof(actual_range_end));
+
+        // Calculate range size
+        sub256(work.range_end, work.range_start, range_len);
+        add256_u64(range_len, 1, range_len);
+
+        std::cout << "[Client] Executing work unit #" << work.unit_id << "\n";
+        std::cout << "[Client] Range: " << formatHex256(actual_range_start) << " : "
+                  << formatHex256(actual_range_end) << "\n";
+    }
 
     // Setup each GPU
     for (int i = 0; i < num_gpus; ++i) {
@@ -764,7 +892,7 @@ void execute_work_unit(std::vector<GPUContext>& contexts,
             carry = prod >> 64;
         }
 
-        add256(work.range_start, offset, ctx.range_start);
+        add256(actual_range_start, offset, ctx.range_start);
         memcpy(ctx.range_len, per_gpu, sizeof(per_gpu));
 
         // Calculate per-thread work

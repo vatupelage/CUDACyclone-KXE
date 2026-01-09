@@ -12,6 +12,7 @@
 #include <csignal>
 #include <ctime>
 #include <vector>
+#include <random>
 
 // Global server pointer for signal handling
 static CycloneServer* g_server = nullptr;
@@ -77,11 +78,23 @@ bool CycloneServer::start() {
         return false;
     }
 
+    // Generate random KXE seed if not provided
+    if (config_.kxe_mode && config_.kxe_seed == 0) {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        config_.kxe_seed = gen();
+    }
+
     std::cout << "[Server] Range: " << arith256::to_hex(config_.range_start)
               << " : " << arith256::to_hex(config_.range_end) << "\n";
     std::cout << "[Server] Work unit size: 2^" << config_.work_unit_bits << " keys\n";
     std::cout << "[Server] Total work units: " << work_manager_.get_total_units() << "\n";
     std::cout << "[Server] Pincer mode: " << (config_.pincer_mode ? "enabled" : "disabled") << "\n";
+    std::cout << "[Server] KXE mode: " << (config_.kxe_mode ? "enabled" : "disabled");
+    if (config_.kxe_mode) {
+        std::cout << " (seed: " << config_.kxe_seed << ")";
+    }
+    std::cout << "\n";
 
     // Try to load checkpoint
     if (!config_.checkpoint_file.empty()) {
@@ -465,6 +478,10 @@ bool CycloneServer::handle_register(uint32_t client_id, const void* payload, uin
         resp.heartbeat_interval = config_.heartbeat_interval_sec;
         resp.progress_interval = config_.progress_interval_sec;
         resp.max_units_per_request = MAX_WORK_UNITS_PER_REQUEST;
+        resp.scan_mode = config_.kxe_mode ? static_cast<uint8_t>(ScanMode::KXE)
+                                          : static_cast<uint8_t>(ScanMode::SEQUENTIAL);
+        resp.kxe_seed = config_.kxe_seed;
+        resp.total_blocks = work_manager_.get_total_units();
 
         net::send_message(client.socket, MessageType::REGISTER_RESPONSE, &resp, sizeof(resp));
     }
@@ -675,14 +692,26 @@ void CycloneServer::release_work_unit(uint32_t unit_id) {
 bool CycloneServer::send_work_assignment(uint32_t client_id, const WorkUnit& wu) {
     WorkAssignmentMsg msg;
     msg.unit_id = wu.unit_id;
-    arith256::copy(wu.range_start, msg.range_start);
-    arith256::copy(wu.range_end, msg.range_end);
+    // For KXE mode, send global range (client computes local range from block index)
+    // For sequential mode, send per-unit range
+    arith256::copy(config_.kxe_mode ? config_.range_start : wu.range_start, msg.range_start);
+    arith256::copy(config_.kxe_mode ? config_.range_end : wu.range_end, msg.range_end);
     memcpy(msg.target_hash160, config_.target_hash160, 20);
     msg.batch_size = config_.batch_size;
     msg.slices = config_.slices_per_launch;
     msg.scan_direction = static_cast<uint8_t>(wu.direction);
     msg.pincer_enabled = config_.pincer_mode ? 1 : 0;
     msg.pincer_partner_unit = wu.pincer_partner_id;
+
+    // KXE mode fields
+    msg.scan_mode = config_.kxe_mode ? static_cast<uint8_t>(ScanMode::KXE)
+                                     : static_cast<uint8_t>(ScanMode::SEQUENTIAL);
+    msg.kxe_block_index = wu.unit_id;  // In KXE mode, unit_id is the block index
+    msg.kxe_seed = config_.kxe_seed;
+
+    // Calculate keys_per_block from work unit size
+    uint64_t keys_per_block = 1ULL << config_.work_unit_bits;
+    msg.keys_per_block = keys_per_block;
 
     std::lock_guard<std::mutex> lock(clients_mutex_);
     auto it = clients_.find(client_id);
@@ -793,7 +822,7 @@ bool CycloneServer::save_checkpoint() {
     // Build header
     ServerCheckpointHeader header;
     header.magic = CHECKPOINT_MAGIC;
-    header.version = 1;
+    header.version = 2;  // v2 adds KXE mode
     header.timestamp = current_time_sec();
     arith256::copy(config_.range_start, header.range_start);
     arith256::copy(config_.range_end, header.range_end);
@@ -806,7 +835,9 @@ bool CycloneServer::save_checkpoint() {
     header.slices = config_.slices_per_launch;
     header.pincer_mode = config_.pincer_mode ? 1 : 0;
     header.found = found_.load() ? 1 : 0;
-    header.reserved[0] = header.reserved[1] = 0;
+    header.kxe_mode = config_.kxe_mode ? 1 : 0;
+    header.reserved = 0;
+    header.kxe_seed = config_.kxe_seed;
     arith256::copy(found_scalar_, header.found_scalar);
 
     // Write header
@@ -1008,6 +1039,8 @@ void print_server_usage(const char* prog_name) {
     std::cout << "  --batch-size <N>            Recommended batch size (default: 128)\n";
     std::cout << "  --slices <N>                Recommended slices (default: 16)\n";
     std::cout << "  --pincer                    Enable bidirectional mode\n";
+    std::cout << "  --kxe                       Enable KXE permuted scanning mode\n";
+    std::cout << "  --kxe-seed <N>              KXE permutation seed (default: random)\n";
     std::cout << "  --checkpoint <file>         Checkpoint file path\n";
     std::cout << "  --checkpoint-interval <N>   Checkpoint interval in seconds (default: 300)\n";
     std::cout << "  --heartbeat-timeout <N>     Client timeout in seconds (default: 90)\n";
@@ -1071,6 +1104,12 @@ bool parse_server_args(int argc, char* argv[], ServerConfig& config) {
         }
         else if (arg == "--pincer") {
             config.pincer_mode = true;
+        }
+        else if (arg == "--kxe") {
+            config.kxe_mode = true;
+        }
+        else if (arg == "--kxe-seed" && i + 1 < argc) {
+            config.kxe_seed = std::stoull(argv[++i]);
         }
         else if (arg == "--checkpoint" && i + 1 < argc) {
             config.checkpoint_file = argv[++i];

@@ -285,75 +285,159 @@ Optional:
 
 ---
 
-## Server Mode (Distributed Computing)
+## Distributed KXE Mode (Server/Client)
+
+KXE mode is fully integrated with the distributed server/client architecture, allowing multiple machines to collaborate on a single search with permuted block scanning.
 
 ### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      KXE Server                              │
-│  - Maintains master counter                                  │
-│  - Assigns block ranges to clients                           │
-│  - Collects results                                          │
+│                   CUDACyclone_Server --kxe                  │
+│  - Maintains block index assignments                        │
+│  - Distributes work units with KXE seed                     │
+│  - Clients compute permuted block locations                 │
+│  - Collects results, manages checkpoints                    │
 └─────────────────────────────────────────────────────────────┘
            │                    │                    │
            ▼                    ▼                    ▼
     ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-    │ KXE Client  │      │ KXE Client  │      │ KXE Client  │
-    │ (GPU 0,1)   │      │ (GPU 0,1,2) │      │ (GPU 0)     │
-    │ stream=0    │      │ stream=1    │      │ stream=2    │
+    │   Client    │      │   Client    │      │   Client    │
+    │ Machine A   │      │ Machine B   │      │ Machine C   │
+    │ 4x RTX 4090 │      │ 2x RTX 5090 │      │ 8x RTX 4090 │
     └─────────────┘      └─────────────┘      └─────────────┘
+```
+
+### Build
+
+```bash
+# Build distributed components
+make distributed
+
+# Or build everything including KXE standalone versions
+make everything
 ```
 
 ### Server Setup
 
-The server assigns **counter ranges** to clients, not key ranges:
-
 ```bash
-# Start server (conceptual - integrate with existing server code)
-./CUDACyclone_Server --mode kxe \
-    --range 10000000000000000:1fffffffffffff \
-    --address <target> \
-    --port 5000
+# Start KXE server
+./CUDACyclone_Server --kxe \
+    --range 400000000000000000:7fffffffffffffffff \
+    --target-hash160 <40-char-hex> \
+    --port 17403 \
+    --unit-bits 36
+
+# With specific seed (for reproducibility)
+./CUDACyclone_Server --kxe --kxe-seed 12345678 \
+    --range 400000000000000000:7fffffffffffffffff \
+    --target-hash160 <hash> \
+    --port 17403
 ```
 
-Server configuration:
-- `--work-unit-size`: Number of block counters per work unit (e.g., 1000)
-- Each client requests work units and reports completion
-- Checkpoint is simply the highest completed counter
+**Server Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--kxe` | Enable KXE permuted scanning | disabled |
+| `--kxe-seed <N>` | Permutation seed | random |
+| `--unit-bits <N>` | Work unit size as 2^N keys | 36 |
+| `--port <N>` | Server port | 17403 |
+| `--checkpoint <file>` | Checkpoint file | none |
+| `--checkpoint-interval <N>` | Save interval (seconds) | 300 |
 
 ### Client Setup
 
 ```bash
-# Connect client to server
-./CUDACyclone_KXE_Client --server <host>:<port> \
+# Connect to KXE server (auto-detects KXE mode)
+./CUDACyclone_Client --server <host>:17403 \
     --grid 128,128 --slices 16
+
+# Use specific GPUs only
+./CUDACyclone_Client --server <host>:17403 \
+    --grid 128,128 --slices 16 --gpus 0,1,2,3
 ```
+
+**Client Output (KXE mode):**
+```
+[Client] Connected!
+[Client] Registered as client #1
+[Client] KXE mode enabled (seed: 9876543210, blocks: 68719476736)
+[Client] Executing KXE block #1234 (permuted: 45678901234)
+[Client] Block range: 7A3F... : 7A3F...
+```
+
+### How Distributed KXE Works
+
+1. **Server** generates a random KXE seed (or uses provided `--kxe-seed`)
+2. **Server** divides range into blocks (2^unit_bits keys each)
+3. **Server** sends block indices + seed to clients
+4. **Clients** permute block index → actual block location
+5. **Clients** search their permuted block range
+6. **Server** tracks completed blocks, manages reassignment
 
 ### Work Unit Protocol
 
 ```
-Client → Server: REQUEST_WORK
-Server → Client: WORK_UNIT {
-    stream_id: 5,
-    counter_start: 1000000,
-    counter_end: 1001000,
-    range_start: 0x10000000000000000,
-    range_end:   0x1fffffffffffff,
-    target_hash160: [20 bytes]
-}
+Registration:
+  Server → Client: {
+    scan_mode: KXE,
+    kxe_seed: 9876543210,
+    total_blocks: 68719476736
+  }
 
-Client → Server: WORK_COMPLETE { counter_end: 1001000 }
-       or
-Client → Server: KEY_FOUND { private_key: [...] }
+Work Assignment:
+  Server → Client: {
+    unit_id: 1234,
+    kxe_block_index: 1234,
+    kxe_seed: 9876543210,
+    keys_per_block: 68719476736,
+    range_start: 0x400000000000000000,  // Global range
+    range_end: 0x7fffffffffffffffff
+  }
+
+Client computes:
+  permuted_block = feistel_permute(1234, seed)
+  actual_start = range_start + permuted_block * keys_per_block
 ```
 
-### Benefits of KXE for Distributed Mode
+### Benefits of Distributed KXE
 
-1. **Minimal State**: Server only tracks counter assignments
-2. **Easy Load Balancing**: Any client can process any counter range
-3. **Fault Tolerant**: Lost work units can be reassigned trivially
-4. **No Coordination**: Clients never overlap by construction
+| Feature | Sequential Mode | KXE Mode |
+|---------|-----------------|----------|
+| Block assignment | Sequential chunks | Permuted indices |
+| Work overlap | Requires coordination | Impossible by design |
+| Resume | Complex range tracking | Simple counter |
+| Load balancing | Fixed ranges | Dynamic, any block |
+| Fault tolerance | Lost progress | Easy reassignment |
+
+### Example: Puzzle 66 on Multiple Machines
+
+**Coordinator (no GPU needed):**
+```bash
+./CUDACyclone_Server --kxe \
+    --range 400000000000000000:7fffffffffffffffff \
+    --target-hash160 3ee4133d991f52fdf6a25c9834e0745ac74248a4 \
+    --port 17403 --unit-bits 36 \
+    --checkpoint puzzle66.ckpt --checkpoint-interval 60
+```
+
+**Machine A (4x RTX 4090):**
+```bash
+./CUDACyclone_Client --server coordinator:17403 --grid 128,128 --slices 16
+```
+
+**Machine B (8x RTX 4090):**
+```bash
+./CUDACyclone_Client --server coordinator:17403 --grid 128,128 --slices 16
+```
+
+**Machine C (2x RTX 5090):**
+```bash
+./CUDACyclone_Client --server coordinator:17403 --grid 128,256 --slices 16
+```
+
+All machines work together, each receiving permuted block indices from the server. The KXE permutation ensures no overlap between any blocks assigned to any clients.
 
 ---
 

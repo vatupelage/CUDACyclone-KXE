@@ -41,6 +41,10 @@ struct ServerConfig {
     uint32_t slices_per_launch;         // Recommended slices for clients
     bool pincer_mode;                   // Enable bidirectional mode
 
+    // KXE mode
+    bool kxe_mode;                      // Enable KXE permuted scanning
+    uint64_t kxe_seed;                  // KXE permutation seed
+
     // Network
     uint16_t port;                      // Server port
     uint32_t max_clients;               // Maximum concurrent clients
@@ -63,6 +67,8 @@ struct ServerConfig {
         batch_size = 128;
         slices_per_launch = 16;
         pincer_mode = false;
+        kxe_mode = false;
+        kxe_seed = 0;
         port = DEFAULT_SERVER_PORT;
         max_clients = MAX_CLIENTS;
         heartbeat_interval_sec = DEFAULT_HEARTBEAT_INTERVAL_SEC;
@@ -140,7 +146,9 @@ struct ServerCheckpointHeader {
     uint32_t slices;
     uint8_t pincer_mode;
     uint8_t found;                      // 1 if key found
-    uint8_t reserved[2];
+    uint8_t kxe_mode;                   // 1 if KXE mode
+    uint8_t reserved;
+    uint64_t kxe_seed;                  // KXE seed (if KXE mode)
     uint64_t found_scalar[4];           // Found key (if any)
     // Followed by: WorkUnit data array
 };

@@ -14,7 +14,7 @@
 
 // Protocol constants
 constexpr uint16_t DEFAULT_SERVER_PORT = 17403;
-constexpr uint32_t PROTOCOL_VERSION = 1;
+constexpr uint32_t PROTOCOL_VERSION = 2;  // v2 adds KXE mode support
 constexpr uint32_t PROTOCOL_MAGIC = 0x4343594B;  // "CCYK" in ASCII
 
 // Timeouts and limits
@@ -91,6 +91,15 @@ enum class WorkUnitState : uint8_t {
 enum class ScanDirection : uint8_t {
     FORWARD     = 0,   // Scan from start toward end (add B each batch)
     BACKWARD    = 1    // Scan from end toward start (subtract B each batch)
+};
+
+// ============================================================================
+// SCAN MODE (sequential vs KXE permuted)
+// ============================================================================
+
+enum class ScanMode : uint8_t {
+    SEQUENTIAL  = 0,   // Traditional sequential scanning
+    KXE         = 1    // KXE permuted block scanning
 };
 
 // ============================================================================
@@ -240,13 +249,17 @@ struct DisconnectMsg {
 // SERVER -> CLIENT MESSAGES
 // ----------------------------------------------------------------------------
 
-// REGISTER_RESPONSE (20 bytes)
+// REGISTER_RESPONSE (40 bytes)
 struct RegisterResponseMsg {
     uint32_t status;                // ErrorCode (0 = OK)
     uint32_t client_id;             // Assigned client ID (0 if rejected)
     uint32_t heartbeat_interval;    // Required heartbeat interval (seconds)
     uint32_t progress_interval;     // Required progress report interval (seconds)
     uint32_t max_units_per_request; // Max work units per request
+    uint8_t  scan_mode;             // ScanMode enum (0=sequential, 1=KXE)
+    uint8_t  reserved1[3];          // Padding
+    uint64_t kxe_seed;              // KXE permutation seed (if KXE mode)
+    uint64_t total_blocks;          // Total blocks in search (for KXE progress)
 
     RegisterResponseMsg() {
         status = static_cast<uint32_t>(ErrorCode::OK);
@@ -254,6 +267,10 @@ struct RegisterResponseMsg {
         heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL_SEC;
         progress_interval = DEFAULT_PROGRESS_INTERVAL_SEC;
         max_units_per_request = MAX_WORK_UNITS_PER_REQUEST;
+        scan_mode = static_cast<uint8_t>(ScanMode::SEQUENTIAL);
+        reserved1[0] = reserved1[1] = reserved1[2] = 0;
+        kxe_seed = 0;
+        total_blocks = 0;
     }
 };
 
@@ -265,18 +282,22 @@ struct HeartbeatAckMsg {
     HeartbeatAckMsg() : status(0), server_time(0) {}
 };
 
-// WORK_ASSIGNMENT (128 bytes per unit)
+// WORK_ASSIGNMENT (152 bytes per unit)
 struct WorkAssignmentMsg {
     uint32_t unit_id;               // Work unit ID
-    uint64_t range_start[4];        // 256-bit range start
-    uint64_t range_end[4];          // 256-bit range end
+    uint64_t range_start[4];        // 256-bit range start (global, for KXE base)
+    uint64_t range_end[4];          // 256-bit range end (global)
     uint8_t  target_hash160[20];    // Target address hash
     uint32_t batch_size;            // Batch size to use
     uint32_t slices;                // Slices per launch
     uint8_t  scan_direction;        // ScanDirection enum
     uint8_t  pincer_enabled;        // 1 if this is part of pincer pair
     uint16_t pincer_partner_unit;   // Partner unit ID (if pincer)
-    uint32_t reserved;              // Padding
+    uint8_t  scan_mode;             // ScanMode enum (0=sequential, 1=KXE)
+    uint8_t  reserved1[3];          // Padding
+    uint64_t kxe_block_index;       // Block index to process (KXE mode)
+    uint64_t kxe_seed;              // Permutation seed (KXE mode)
+    uint64_t keys_per_block;        // Keys per block (KXE mode)
 
     WorkAssignmentMsg() {
         unit_id = 0;
@@ -288,7 +309,11 @@ struct WorkAssignmentMsg {
         scan_direction = static_cast<uint8_t>(ScanDirection::FORWARD);
         pincer_enabled = 0;
         pincer_partner_unit = 0;
-        reserved = 0;
+        scan_mode = static_cast<uint8_t>(ScanMode::SEQUENTIAL);
+        reserved1[0] = reserved1[1] = reserved1[2] = 0;
+        kxe_block_index = 0;
+        kxe_seed = 0;
+        keys_per_block = 0;
     }
 };
 
