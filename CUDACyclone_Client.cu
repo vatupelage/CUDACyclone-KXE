@@ -874,14 +874,40 @@ void execute_work_unit(std::vector<GPUContext>& contexts,
                   << formatHex256(actual_range_end) << "\n";
     }
 
+    // For small work units, limit to 1 GPU to avoid division resulting in 0 work per thread
+    uint64_t total_keys = range_len[0];  // Assume fits in 64 bits for small units
+    if (range_len[1] != 0 || range_len[2] != 0 || range_len[3] != 0) {
+        total_keys = UINT64_MAX;  // Large range, use all GPUs
+    }
+
+    // Calculate minimum keys needed per GPU to have at least 1 batch per thread
+    // min_keys = threadsTotal * batch_size (at least 1 batch per thread)
+    uint64_t min_keys_per_gpu = (uint64_t)contexts[0].threadsTotal * batch_size;
+    int effective_gpus = num_gpus;
+    if (total_keys < (uint64_t)num_gpus * min_keys_per_gpu) {
+        // Work unit too small for all GPUs, use fewer
+        effective_gpus = std::max(1, (int)(total_keys / min_keys_per_gpu));
+        if (effective_gpus < num_gpus) {
+            std::cout << "[Client] Work unit small, using " << effective_gpus
+                      << " of " << num_gpus << " GPUs\n";
+        }
+    }
+
     // Setup each GPU
     for (int i = 0; i < num_gpus; ++i) {
         GPUContext& ctx = contexts[i];
         CUDA_CHECK(cudaSetDevice(ctx.deviceId));
 
-        // Divide range among GPUs
+        // Skip GPUs beyond effective count for small work units
+        if (i >= effective_gpus) {
+            ctx.completed.store(true);  // Mark as done
+            ctx.per_thread_cnt[0] = ctx.per_thread_cnt[1] = ctx.per_thread_cnt[2] = ctx.per_thread_cnt[3] = 0;
+            continue;
+        }
+
+        // Divide range among effective GPUs
         uint64_t per_gpu[4], remainder;
-        divmod_256_by_u64(range_len, num_gpus, per_gpu, remainder);
+        divmod_256_by_u64(range_len, effective_gpus, per_gpu, remainder);
 
         // Calculate offset for this GPU
         uint64_t offset[4] = {0, 0, 0, 0};
@@ -902,18 +928,37 @@ void execute_work_unit(std::vector<GPUContext>& contexts,
         uint64_t batches[4];
         divmod_256_by_u64(total_keys_this_gpu, batch_size, batches, remainder);
 
-        divmod_256_by_u64(batches, ctx.threadsTotal, ctx.per_thread_cnt, remainder);
+        // Ensure at least 1 batch per thread by reducing active threads if needed
+        uint64_t total_batches = batches[0];
+        uint64_t active_threads = ctx.threadsTotal;
+        if (total_batches < ctx.threadsTotal) {
+            active_threads = std::max((uint64_t)1, total_batches);
+        }
+
+        uint64_t batches_per_thread = (total_batches + active_threads - 1) / active_threads;
+        ctx.per_thread_cnt[0] = batches_per_thread;
+        ctx.per_thread_cnt[1] = ctx.per_thread_cnt[2] = ctx.per_thread_cnt[3] = 0;
 
         // Initialize thread scalars
         for (uint64_t t = 0; t < ctx.threadsTotal; ++t) {
-            uint64_t thread_batch_offset = t * ctx.per_thread_cnt[0] * batch_size;
             uint64_t scalar[4];
-            memcpy(scalar, ctx.range_start, sizeof(scalar));
-            add256_u64(scalar, thread_batch_offset + batch_size / 2, scalar);
+            uint64_t keys_to_process;
+
+            if (t < active_threads) {
+                // This thread has work
+                uint64_t thread_batch_offset = t * batches_per_thread * batch_size;
+                memcpy(scalar, ctx.range_start, sizeof(scalar));
+                add256_u64(scalar, thread_batch_offset + batch_size / 2, scalar);
+                keys_to_process = batches_per_thread * batch_size;
+            } else {
+                // This thread has no work
+                memset(scalar, 0, sizeof(scalar));
+                keys_to_process = 0;
+            }
 
             for (int j = 0; j < 4; ++j) {
                 ctx.h_start_scalars[t * 4 + j] = scalar[j];
-                ctx.h_counts256[t * 4 + j] = (j == 0) ? ctx.per_thread_cnt[0] * batch_size : 0;
+                ctx.h_counts256[t * 4 + j] = (j == 0) ? keys_to_process : 0;
             }
         }
 
