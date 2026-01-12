@@ -391,8 +391,29 @@ public:
             unit_bits = range_bits;
         }
 
-        // Calculate number of work units
-        uint32_t num_units = 1U << (range_bits - unit_bits);
+        // Calculate number of work units (use 64-bit to avoid overflow)
+        int shift = range_bits - unit_bits;
+        if (shift > 32) {
+            // Too many work units to handle in memory
+            // Suggest using larger work unit size
+            std::cerr << "[WorkUnitManager] Error: Range would create 2^" << shift
+                      << " work units (max 2^32). Increase --unit-bits to at least "
+                      << (range_bits - 32) << ".\n";
+            return false;
+        }
+        uint64_t num_units_64 = 1ULL << shift;
+
+        // Limit max units to prevent excessive memory usage
+        // Each WorkUnit is ~120 bytes, 10M units = ~1.2GB
+        constexpr uint64_t MAX_WORK_UNITS = 10000000ULL;  // 10M max
+        if (num_units_64 > MAX_WORK_UNITS) {
+            std::cerr << "[WorkUnitManager] Error: Range would create " << num_units_64
+                      << " work units (max " << MAX_WORK_UNITS << ").\n";
+            std::cerr << "[WorkUnitManager] Increase --unit-bits to at least "
+                      << (range_bits - 23) << " (for ~8M units).\n";
+            return false;
+        }
+        uint32_t num_units = (uint32_t)num_units_64;
 
         // Store configuration
         arith256::copy(range_start, range_start_);

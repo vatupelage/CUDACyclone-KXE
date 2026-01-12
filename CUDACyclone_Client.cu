@@ -747,6 +747,16 @@ bool request_work(WorkAssignmentMsg& work) {
     }
 
     if (header.type() == MessageType::WORK_ASSIGNMENT) {
+        // Verify payload size matches expected struct size
+        if (header.payload_size != sizeof(work)) {
+            std::cerr << "[Client] ERROR: WorkAssignmentMsg size mismatch! "
+                      << "Expected " << sizeof(work) << " bytes, server sent "
+                      << header.payload_size << " bytes\n";
+            // Try to receive what the server sent to avoid protocol desync
+            std::vector<uint8_t> discard(header.payload_size);
+            net::recv_message_payload(g_server_socket, discard.data(), header.payload_size);
+            return false;
+        }
         return net::recv_message_payload(g_server_socket, &work, sizeof(work));
     }
     else if (header.type() == MessageType::NO_WORK_AVAILABLE) {
@@ -842,6 +852,7 @@ void execute_work_unit(std::vector<GPUContext>& contexts,
 
         // Calculate block start: global_range_start + permuted_block * keys_per_block
         memcpy(actual_range_start, work.range_start, sizeof(actual_range_start));
+
         uint64_t block_offset[4] = {0, 0, 0, 0};
         __uint128_t prod = (__uint128_t)permuted_block * work.keys_per_block;
         block_offset[0] = (uint64_t)prod;
@@ -860,6 +871,8 @@ void execute_work_unit(std::vector<GPUContext>& contexts,
                   << " (permuted: " << permuted_block << ")\n";
         std::cout << "[Client] Block range: " << formatHex256(actual_range_start)
                   << " : " << formatHex256(actual_range_end) << "\n";
+        std::cout << "[Client] Keys per block: " << work.keys_per_block
+                  << ", Total blocks: " << total_blocks << "\n";
     } else {
         // Sequential mode: use range directly
         memcpy(actual_range_start, work.range_start, sizeof(actual_range_start));

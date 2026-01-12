@@ -147,7 +147,7 @@ struct GPUInfoMsg {
 // CLIENT -> SERVER MESSAGES
 // ----------------------------------------------------------------------------
 
-// REGISTER_REQUEST (variable size: 24 + hostname_len + gpu_count * 80)
+// REGISTER_REQUEST (variable size: 20 + hostname_len + gpu_count * 80)
 struct RegisterRequestMsg {
     uint32_t protocol_version;      // Must match PROTOCOL_VERSION
     uint32_t gpu_count;             // Number of GPUs on this client
@@ -217,7 +217,7 @@ struct UnitCompleteMsg {
     UnitCompleteMsg() : client_id(0), unit_id(0), keys_processed(0), avg_speed_gkeys(0.0) {}
 };
 
-// FOUND_RESULT (120 bytes)
+// FOUND_RESULT (128 bytes)
 struct FoundResultMsg {
     uint32_t client_id;             // Client that found it
     uint32_t unit_id;               // Work unit where found
@@ -282,7 +282,7 @@ struct HeartbeatAckMsg {
     HeartbeatAckMsg() : status(0), server_time(0) {}
 };
 
-// WORK_ASSIGNMENT (152 bytes per unit)
+// WORK_ASSIGNMENT (128 bytes per unit)
 struct WorkAssignmentMsg {
     uint32_t unit_id;               // Work unit ID
     uint64_t range_start[4];        // 256-bit range start (global, for KXE base)
@@ -334,7 +334,7 @@ struct SearchCompleteMsg {
     SearchCompleteMsg() : total_keys_searched(0), total_work_units(0), found(0) {}
 };
 
-// KEY_FOUND (88 bytes) - broadcast to all clients when key is found
+// KEY_FOUND (84 bytes) - broadcast to all clients when key is found
 struct KeyFoundMsg {
     uint32_t finder_client_id;      // Client that found it
     uint32_t unit_id;               // Work unit where found
@@ -370,6 +370,29 @@ struct ErrorResponseMsg {
 };
 
 #pragma pack(pop)
+
+// ============================================================================
+// STRUCT SIZE VERIFICATION
+// ============================================================================
+// Verify packed struct sizes at compile time to prevent protocol mismatches
+
+static_assert(sizeof(MessageHeader) == 8, "MessageHeader size mismatch");
+static_assert(sizeof(GPUInfoMsg) == 80, "GPUInfoMsg size mismatch");
+static_assert(sizeof(RegisterRequestMsg) == 20, "RegisterRequestMsg size mismatch");
+static_assert(sizeof(HeartbeatMsg) == 16, "HeartbeatMsg size mismatch");
+static_assert(sizeof(WorkRequestMsg) == 8, "WorkRequestMsg size mismatch");
+static_assert(sizeof(ProgressReportMsg) == 32, "ProgressReportMsg size mismatch");
+static_assert(sizeof(UnitCompleteMsg) == 24, "UnitCompleteMsg size mismatch");
+static_assert(sizeof(FoundResultMsg) == 128, "FoundResultMsg size mismatch");
+static_assert(sizeof(DisconnectMsg) == 4, "DisconnectMsg size mismatch");
+static_assert(sizeof(RegisterResponseMsg) == 40, "RegisterResponseMsg size mismatch");
+static_assert(sizeof(HeartbeatAckMsg) == 8, "HeartbeatAckMsg size mismatch");
+static_assert(sizeof(WorkAssignmentMsg) == 128, "WorkAssignmentMsg size mismatch");
+static_assert(sizeof(NoWorkAvailableMsg) == 8, "NoWorkAvailableMsg size mismatch");
+static_assert(sizeof(SearchCompleteMsg) == 16, "SearchCompleteMsg size mismatch");
+static_assert(sizeof(KeyFoundMsg) == 84, "KeyFoundMsg size mismatch");
+static_assert(sizeof(ServerShutdownMsg) == 8, "ServerShutdownMsg size mismatch");
+static_assert(sizeof(ErrorResponseMsg) == 8, "ErrorResponseMsg size mismatch");
 
 // ============================================================================
 // HELPER FUNCTIONS
