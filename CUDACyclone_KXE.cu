@@ -584,6 +584,7 @@ bool kxe_save_checkpoint(const std::string& filename,
                           const uint64_t range_width[4],
                           const uint8_t target_hash160[20],
                           uint32_t num_streams, uint32_t batch_size, uint32_t slices,
+                          uint32_t batches_per_sm,
                           bool found, const uint64_t found_scalar[4]) {
     std::string temp_file = filename + ".tmp";
     std::ofstream file(temp_file, std::ios::binary);
@@ -604,6 +605,7 @@ bool kxe_save_checkpoint(const std::string& filename,
     header.num_streams = num_streams;
     header.batch_size = batch_size;
     header.slices = slices;
+    header.batches_per_sm = batches_per_sm;
     header.found = found ? 1 : 0;
     if (found) {
         memcpy(header.found_scalar, found_scalar, sizeof(header.found_scalar));
@@ -626,6 +628,7 @@ bool kxe_load_checkpoint(const std::string& filename,
                           uint64_t range_start[4], uint64_t range_width[4],
                           uint8_t target_hash160[20],
                           uint32_t& num_streams, uint32_t& batch_size, uint32_t& slices,
+                          uint32_t& batches_per_sm,
                           bool& found, uint64_t found_scalar[4]) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
@@ -635,8 +638,21 @@ bool kxe_load_checkpoint(const std::string& filename,
     KXECheckpointHeader header;
     file.read(reinterpret_cast<char*>(&header), sizeof(header));
 
+    // Check for old v1 checkpoint format (without batches_per_sm)
+    if (header.magic == 0x3158454BU) {  // Old "KXE1" magic
+        std::cerr << "Error: Old checkpoint format (v1) detected.\n";
+        std::cerr << "This checkpoint was created without batches_per_sm and cannot be safely resumed.\n";
+        std::cerr << "Please start a fresh search to avoid missing keys.\n";
+        return false;
+    }
+
     if (header.magic != KXE_CHECKPOINT_MAGIC) {
         std::cerr << "Error: Invalid KXE checkpoint file\n";
+        return false;
+    }
+
+    if (header.version < KXE_CHECKPOINT_VERSION) {
+        std::cerr << "Error: Checkpoint version " << header.version << " is older than expected " << KXE_CHECKPOINT_VERSION << "\n";
         return false;
     }
 
@@ -646,6 +662,7 @@ bool kxe_load_checkpoint(const std::string& filename,
     num_streams = header.num_streams;
     batch_size = header.batch_size;
     slices = header.slices;
+    batches_per_sm = header.batches_per_sm;
     found = (header.found != 0);
     if (found) {
         memcpy(found_scalar, header.found_scalar, sizeof(header.found_scalar));
@@ -744,18 +761,35 @@ int main(int argc, char** argv) {
     uint64_t found_scalar[4] = {0, 0, 0, 0};
     bool already_found = false;
 
+    // GPU setup (need this before checkpoint validation)
+    cudaDeviceProp prop;
+    ck(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
+
     if (resume_mode && !checkpoint_file.empty()) {
         uint64_t ckpt_start[4], ckpt_width[4];
         uint8_t ckpt_hash[20];
-        uint32_t ckpt_streams, ckpt_batch, ckpt_slices;
+        uint32_t ckpt_streams, ckpt_batch, ckpt_slices, ckpt_batches_per_sm;
 
         if (kxe_load_checkpoint(checkpoint_file, stream_id, counter,
                                  ckpt_start, ckpt_width, ckpt_hash,
                                  ckpt_streams, ckpt_batch, ckpt_slices,
+                                 ckpt_batches_per_sm,
                                  already_found, found_scalar)) {
             std::cout << "Resuming from checkpoint:\n";
             std::cout << "  Stream ID: " << stream_id << "\n";
             std::cout << "  Counter: " << counter << "\n";
+            std::cout << "  Checkpoint batches_per_sm: " << ckpt_batches_per_sm << "\n";
+
+            // Validate batches_per_sm matches
+            if (ckpt_batches_per_sm != batches_per_sm) {
+                std::cerr << "\nError: Grid parameter mismatch!\n";
+                std::cerr << "  Checkpoint was created with --grid " << ckpt_batch << "," << ckpt_batches_per_sm << "\n";
+                std::cerr << "  Current command uses --grid " << batch_size << "," << batches_per_sm << "\n";
+                std::cerr << "\nThis would cause keys to be skipped! Use the same --grid values:\n";
+                std::cerr << "  --grid " << ckpt_batch << "," << ckpt_batches_per_sm << "\n";
+                return EXIT_FAILURE;
+            }
+
             batch_size = ckpt_batch;
             slices = ckpt_slices;
             num_streams = ckpt_streams;
@@ -767,10 +801,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-
-    // GPU setup
-    cudaDeviceProp prop;
-    ck(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
 
     int threadsPerBlock = 256;
     int blocks = prop.multiProcessorCount * batches_per_sm;
@@ -978,6 +1008,7 @@ int main(int argc, char** argv) {
                         kxe_save_checkpoint(checkpoint_file, stream_id, block_counter,
                                             range_start, range_width, target_hash160,
                                             num_streams, batch_size, slices,
+                                            batches_per_sm,
                                             false, zero_scalar);
                         std::cout << " [CKPT]";
                         std::cout.flush();
@@ -1004,6 +1035,7 @@ int main(int argc, char** argv) {
             kxe_save_checkpoint(checkpoint_file, stream_id, block_counter,
                                 range_start, range_width, target_hash160,
                                 num_streams, batch_size, slices,
+                                batches_per_sm,
                                 true, host_result.scalar);
         }
     } else if (g_sigint) {
@@ -1013,6 +1045,7 @@ int main(int argc, char** argv) {
             kxe_save_checkpoint(checkpoint_file, stream_id, block_counter,
                                 range_start, range_width, target_hash160,
                                 num_streams, batch_size, slices,
+                                batches_per_sm,
                                 false, zero_scalar);
             std::cout << "Checkpoint saved: " << checkpoint_file << "\n";
             std::cout << "Resume with: --resume --checkpoint " << checkpoint_file << "\n";

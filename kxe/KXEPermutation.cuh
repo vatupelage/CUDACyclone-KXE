@@ -306,7 +306,7 @@ struct KXECheckpointEntry {
 };
 
 struct KXECheckpointHeader {
-    uint32_t magic;           // "KXE1" = 0x3158454B
+    uint32_t magic;           // "KXE2" = 0x3258454B
     uint32_t version;
     uint64_t timestamp;
     uint64_t range_start[4];  // 256-bit
@@ -316,13 +316,14 @@ struct KXECheckpointHeader {
     uint32_t num_streams;
     uint32_t batch_size;
     uint32_t slices;
+    uint32_t batches_per_sm;  // Second value of --grid (critical for keys_per_block)
     uint32_t found;           // 0 = not found, 1 = found
     uint64_t found_scalar[4]; // If found
     // Followed by num_gpus KXECheckpointEntry structs
 };
 
-#define KXE_CHECKPOINT_MAGIC 0x3158454BU  // "KXE1"
-#define KXE_CHECKPOINT_VERSION 1
+#define KXE_CHECKPOINT_MAGIC 0x3258454BU  // "KXE2"
+#define KXE_CHECKPOINT_VERSION 2
 
 // ============================================================================
 // KERNEL INTEGRATION HELPERS
